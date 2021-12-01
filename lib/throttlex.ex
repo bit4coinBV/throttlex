@@ -4,114 +4,130 @@ defmodule Throttlex do
   """
   use GenServer
 
-  @buckets Application.get_env(:throttlex, :buckets) || []
-
   @type key :: integer | binary | tuple | atom
 
-  @spec check(atom, key) :: :ok | :error
-  def check(name, id), do: check(name, id, nil)
+  defstruct [:bucket_name, :rate_per_second, :max_accumulated]
 
-  @spec check(atom, key, integer | nil) :: :ok | :error
-  Enum.map(@buckets, fn {name, config} ->
-    [rate_per_second: rate, max_accumulated: max, cost: cost] = config
-    def check(unquote(name), id, cost) do
-      Throttlex.do_check(unquote(name), id, unquote(rate), unquote(max), cost || unquote(cost))
-    end
-  end)
+  @doc """
+  Check the rate.
+  """
+  def check_rate(bucket_name, id, cost),
+    do: GenServer.call(server_name(bucket_name), {:check_rate, id, cost})
 
-  def check(name, _id, _cost) do
-    raise "#{name} is not configured"
-  end
-
-  @doc false
-  def start_link() do
-    if Application.get_env(:throttlex, :verbose, false) == true do
-      IO.inspect @buckets
-    end
-    new_table(Keyword.keys(@buckets))
-    GenServer.start_link(__MODULE__, [], [name: __MODULE__])
-  end
-
-  @spec new_table([atom]) :: nil
-  defp new_table([]), do: nil
-  defp new_table([name | names]) do
-    :ets.new(name, [:public, :named_table, :set, write_concurrency: true, read_concurrency: true])
-    new_table(names)
+  @doc """
+  Returns amount of available tokens.
+  """
+  def get_available_tokens(bucket_name, id) do
+    GenServer.call(server_name(bucket_name), {:get_available_tokens, id})
   end
 
   @doc """
-  Check user's rate, same `rate_per_second`, `max_accumulated` should be passed to check functions
-  in order to inspect user's rate.
-
-  ##Arguments:
-   - `table`: an atom representing bucket name.
-   - `id`: id.
-   - `rate_per_second`: how many rates should be added to bucket per second.
-   - `max_accumulated`: maximum rates allowed in the bucket.
-   - `cost`: costs of each request.
-
-  ##Examples:
-    # For user id 1, one extra request will be added to bucket, maximum accumulated requests number
-    is 4, and every request will cost 1 token. First request will be permitted.
-    iex> Throttlex.check(:user_request, 1, 1, 2, 1)
-    :ok
-
-    # Second request is permitted also since we allowed 2 requests maximum.
-    iex> Throttlex.check(:user_request, 1, 1, 2, 1)
-    :ok
-
-    # If the third request is made within 1 second (the recovery time), it will return :error.
-    iex> Throttlex.check(:user_request, 1, 1, 2, 1)
-    :error
+  Increments (or decrements by passing negative amount) current rate bypassing the check.
   """
+  def increment_available_tokens(bucket_name, id, amount) do
+    GenServer.cast(server_name(bucket_name), {:increment_tokens_left, id, amount})
+  end
 
-  @spec do_check(atom, key, integer, integer, integer) :: :ok | :error
-  def do_check(table, id, rate_per_second, max_accumulated, cost) do
+  def start_link(opts) do
+    bucket_name = Keyword.fetch!(opts, :bucket_name)
+    max_accumulated = Keyword.fetch!(opts, :max_accumulated)
+    rate_per_second = Keyword.fetch!(opts, :rate_per_second)
+
+    GenServer.start_link(
+      __MODULE__,
+      %__MODULE__{
+        bucket_name: bucket_name,
+        max_accumulated: max_accumulated,
+        rate_per_second: rate_per_second
+      },
+      name: server_name(bucket_name)
+    )
+  end
+
+  @impl GenServer
+  def init(%__MODULE__{} = state) do
+    create_ets_table(state)
+
+    {:ok, state}
+  end
+
+  defp create_ets_table(%__MODULE__{} = state) do
+    :ets.new(state.bucket_name, [
+      :named_table,
+      :set
+    ])
+  end
+
+  defp server_name(bucket_name), do: :"throttlex_#{bucket_name}"
+
+  @impl GenServer
+  def handle_cast({:increment_tokens_left, id, amount}, state) do
     now = :erlang.system_time(:milli_seconds)
+    table = state.bucket_name
+
     case :ets.lookup(table, id) do
       [] ->
-        :ets.insert(table, {id, max_accumulated - cost, now})
+        :ets.insert(table, {id, state.max_accumulated + amount, now})
+
         :ok
-      [{id, tokens_left, last_time}] ->
-        tokens = tokens_left + (now - last_time)/1000 * rate_per_second
 
-        tokens = case tokens > max_accumulated do
-          true -> max_accumulated
-          false -> tokens
-        end
+      [{id, tokens, last_time}] ->
+        accumulated_tokens = calculate_accumulated_tokens(tokens, now, last_time, state)
+        tokens_left = (accumulated_tokens + amount) |> IO.inspect()
 
-        case tokens < cost do
-          true -> :error
-          false ->
-            :ets.update_element(table, id, [{2, tokens - cost} ,{3, now}])
-            :ok
-        end
+        :ets.update_element(table, id, [{2, tokens_left}, {3, now}])
     end
+
+    {:noreply, state}
   end
 
-  @doc """
-  Clear given ets table, this is often needed in tests
-  """
-  @spec clear(atom | [atom] ) :: :ok
-  def clear([]), do: :ok
-  def clear([table | tables]) do
-    clear(table)
-    clear(tables)
+  @impl GenServer
+  def handle_call({:get_available_tokens, id}, _from, %__MODULE__{} = state) do
+    available_tokens =
+      case :ets.lookup(state.bucket_name, id) do
+        [] -> nil
+        [{_id, tokens_left, _last_inserted_at}] -> tokens_left
+      end
+
+    {:reply, available_tokens, state}
   end
 
-  def clear(table) do
-    :ets.delete_all_objects(table)
-    :ok
+  def handle_call({:check_rate, id, cost}, _from, %__MODULE__{} = state) do
+    now = :erlang.system_time(:milli_seconds)
+    table = state.bucket_name
+
+    response =
+      case :ets.lookup(table, id) do
+        [] ->
+          tokens_left = state.max_accumulated - cost
+
+          :ets.insert(table, {id, tokens_left, now})
+
+          {:allow, tokens_left}
+
+        [{id, tokens, last_time}] ->
+          accumulated_tokens = calculate_accumulated_tokens(tokens, now, last_time, state)
+          tokens_left = accumulated_tokens - cost
+
+          if tokens_left < 0 do
+            :deny
+          else
+            :ets.update_element(table, id, [{2, tokens_left}, {3, now}])
+
+            {:allow, tokens_left}
+          end
+      end
+
+    {:reply, response, state}
   end
 
-  def clear_all() do
-    clear(Keyword.keys(@buckets))
-  end
+  defp calculate_accumulated_tokens(tokens, now, last_inserted_at, %__MODULE__{} = state) do
+    accumulated_tokens = tokens + (now - last_inserted_at) / 1000 * state.rate_per_second
 
-  def inspect(table, id) do
-    case :ets.lookup(table, id) do
-      [] -> nil
-      [{_id, tokens_left, _last_time}] -> tokens_left
+    if accumulated_tokens > state.max_accumulated do
+      state.max_accumulated
+    else
+      accumulated_tokens
     end
   end
 end
